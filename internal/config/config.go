@@ -19,7 +19,7 @@ func Load() (*Config, error) {
 		Port:              getEnvAsInt("PORT", 3000),
 		HathorNodeURL:     getEnv("HATHOR_NODE_URL", "http://localhost:8080"),
 		HathorWalletURL:   getEnv("HATHOR_WALLET_URL", "http://localhost:8000"),
-		HathorWalletID:    getEnv("HATHOR_WALLET_ID", "merchant-wallet"),
+		HathorWalletID:    getEnv("HATHOR_WALLET_ID", "main-wallet"),
 		MinConfirmations:  getEnvAsInt("MIN_CONFIRMATIONS", 1),
 	}
 

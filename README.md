@@ -53,7 +53,7 @@ The facilitator can be configured using environment variables:
 - `PORT` - HTTP server port (default: 3000)
 - `HATHOR_NODE_URL` - Hathor full node URL (default: `http://localhost:8080`)
 - `HATHOR_WALLET_URL` - Hathor headless wallet URL (default: `http://localhost:8000`)
-- `HATHOR_WALLET_ID` - Wallet ID for headless wallet (default: `merchant-wallet`)
+- `HATHOR_WALLET_ID` - Wallet ID for headless wallet (default: `main-wallet`)
 - `MIN_CONFIRMATIONS` - Minimum confirmations required before returning success (default: 1)
 
 Example:
@@ -85,21 +85,37 @@ The facilitator will start on port 3000 (or the port specified in `PORT`).
 
 Verifies a payment payload without broadcasting the transaction.
 
-**Request Body:**
-```json
-{
-  "scheme": "exact",
-  "network": "HathorTestnet",
-  "payload": {
-    "txHex": "00010002..."
-  },
-  "requirements": {
-    "amount": 100,
-    "asset": "HTR",
-    "address": "WPT6...abcd"
-  }
-}
-```
+**Request Options:**
+
+The facilitator supports two ways to send the payment payload:
+
+1. **X-PAYMENT Header (Recommended for x402 compliance):**
+   The payment payload can be sent as a base64-encoded JSON string in the `X-PAYMENT` header:
+   
+   ```bash
+   curl -X POST http://localhost:3000/verify \
+     -H "Content-Type: application/json" \
+     -H "X-PAYMENT: <base64-encoded-payment-payload>" \
+     -d '{"requirements": {"amount": 100, "asset": "HTR", "address": "WPT6..."}}'
+   ```
+
+2. **Request Body:**
+   Alternatively, send the full request as JSON in the body:
+   
+   ```json
+   {
+     "scheme": "exact",
+     "network": "HathorTestnet",
+     "payload": {
+       "txHex": "00010002..."
+     },
+     "requirements": {
+       "amount": 100,
+       "asset": "HTR",
+       "address": "WPT6...abcd"
+     }
+   }
+   ```
 
 **Response:**
 ```json
@@ -114,7 +130,7 @@ Verifies a payment payload without broadcasting the transaction.
 
 Broadcasts the transaction and waits for confirmation.
 
-**Request Body:** (Same as `/verify`)
+**Request Options:** (Same as `/verify` - supports both X-PAYMENT header and request body)
 
 **Response:**
 ```json
