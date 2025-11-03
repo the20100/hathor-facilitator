@@ -32,7 +32,7 @@ all: deps build
 
 # Run with default settings
 dev:
-	@PORT=3000 \
+	@PORT=8443 \
 	HATHOR_NODE_URL=http://localhost:8080 \
 	HATHOR_WALLET_URL=http://localhost:8000 \
 	HATHOR_WALLET_ID=facilitator-wallet \

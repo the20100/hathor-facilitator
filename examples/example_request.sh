@@ -4,7 +4,7 @@
 
 # Example 1: Verify a payment
 echo "Example 1: Verifying a payment..."
-#curl -X POST http://localhost:3000/verify \
+#curl -X POST http://localhost:8443/verify \
 #  -H "Content-Type: application/json" \
 #  -d '{
 #    "scheme": "exact",
@@ -32,18 +32,18 @@ echo "Example 1: Verifying a payment..."
     }
   }
 
-curl -X POST http://localhost:3000/verify \
+curl -X POST http://localhost:8443/verify \
   -H "Content-Type: application/json" \
   -H "X-PAYMENT: ewogICAgInNjaGVtZSI6ICJleGFjdCIsCiAgICAibmV0d29yayI6ICJIYXRob3JUZXN0bmV0IiwKICAgICJwYXlsb2FkIjogewogICAgICAidHhIZXgiOiAiMDAwMTAwMDEwMjAwMDAwN2NlNTZiODU5N2ZhNGM5NzFiMzVkYWZjYmMwNGNmNTAxMDZhNTIxNTJkZjdlOWJkNTcxMWNhZTYzYWUwMDAwMjA0ZTFkZmQxMGEyMjlmYmVmOGE4ZDE2ZTM1MTM2ODc5ODI1NTA2MzhmZTE5MjI3NWE1YmRlN2ZiYmQ1ODFlZDBhMDAwMDAxMmMwMDAwMTk3NmE5MTRmZmQ0NWNhNGMwNmE2MjBlODBmZmZmZjkyNmUwY2ZhMDI3ZGVjYTMxODhhYzAwMDAwMDY0MDAwMDE5NzZhOTE0MGYwZWQyZGZmMmZmZTRhYWI0MDliZWQ3MDZiNTZkMmVhNzQyOGVkNTg4YWMwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIgogICAgfSwKICAgICJyZXF1aXJlbWVudHMiOiB7CiAgICAgICJhbW91bnQiOiAxMDAsCiAgICAgICJhc3NldCI6ICIwMCIsCiAgICAgICJhZGRyZXNzIjogIldRM2VtbXhZeXBaZHVUc1JnQTd4NnMxQmo1R3FzUGNubW8iCiAgICB9CiAgfQ==" | python3 -m json.tool
 
 
 # Example 2: Check health
 echo -e "\nExample 2: Health check..."
-curl http://localhost:3000/health
+curl http://localhost:8443/health
 
 # Example 3: Settle a payment (same payload as verify)
 echo -e "\nExample 3: Settling a payment..."
-curl -X POST http://localhost:3000/settle \
+curl -X POST http://localhost:8443/settle \
   -H "Content-Type: application/json" \
   -d '{
     "scheme": "exact",
