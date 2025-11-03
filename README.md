@@ -66,14 +66,12 @@ export HATHOR_WALLET_ID=facilitator-wallet
 export MIN_CONFIRMATIONS=1
 ```
 
-
 ## Running
 
 Start the facilitator:
 ```bash
 ./hathor-facilitator
 ```
-
 Or run directly:
 ```bash
 go run main.go
