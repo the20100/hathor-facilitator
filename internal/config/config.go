@@ -16,7 +16,7 @@ type Config struct {
 
 func Load() (*Config, error) {
 	cfg := &Config{
-		Port:              getEnvAsInt("PORT", 8443),
+		Port:              getEnvAsInt("PORT", 3000),
 		HathorNodeURL:     getEnv("HATHOR_NODE_URL", "http://localhost:8080"),
 		HathorWalletURL:   getEnv("HATHOR_WALLET_URL", "http://localhost:8000"),
 		HathorWalletID:    getEnv("HATHOR_WALLET_ID", "main-wallet"),

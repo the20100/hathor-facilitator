@@ -51,7 +51,7 @@ go build -o hathor-facilitator
 
 The facilitator can be configured using environment variables:
 
-- `PORT` - HTTP server port (default: 8443)
+- `PORT` - HTTP server port (default: 3000)
 - `HATHOR_NODE_URL` - Hathor full node URL (default: `http://localhost:8080`)
 - `HATHOR_WALLET_URL` - Hathor headless wallet URL (default: `http://localhost:8000`)
 - `HATHOR_WALLET_ID` - Wallet ID for headless wallet (default: `main-wallet`)
@@ -59,7 +59,7 @@ The facilitator can be configured using environment variables:
 
 Example:
 ```bash
-export PORT=8443
+export PORT=3000
 export HATHOR_NODE_URL=http://localhost:8080
 export HATHOR_WALLET_URL=http://localhost:8000
 export HATHOR_WALLET_ID=facilitator-wallet
@@ -78,7 +78,7 @@ Or run directly:
 go run main.go
 ```
 
-The facilitator will start on port 8443 (or the port specified in `PORT`).
+The facilitator will start on port 3000 (or the port specified in `PORT`).
 
 ## API Endpoints
 
@@ -115,7 +115,7 @@ The facilitator supports two ways to send the payment payload:
    The payment payload can be sent as a base64-encoded JSON string in the `X-PAYMENT` header:
    
    ```bash
-   curl -X POST http://localhost:8443/verify \
+   curl -X POST http://localhost:3000/verify \
      -H "Content-Type: application/json" \
      -H "X-PAYMENT: <base64-encoded-payment-payload>" \
      -d '{"requirements": {"amount": 100, "asset": "HTR", "address": "WPT6..."}}'
@@ -204,7 +204,7 @@ For testing, you can use Hathor's testnet or localnet:
 Example test using `curl`:
 
 ```bash
-curl -X POST http://localhost:8443/verify \
+curl -X POST http://localhost:3000/verify \
   -H "Content-Type: application/json" \
   -d '{
     "scheme": "exact",
