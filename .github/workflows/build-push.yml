@@ -29,5 +29,5 @@ jobs:
           build-args: |
             BUILD_PATH=.
           tags: |
-            ghcr.io/the20100/hathor-facilitator:latest
-            ghcr.io/the20100/hathor-facilitator:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/hathor-facilitator:latest
+            ghcr.io/${{ github.repository_owner }}/hathor-facilitator:${{ github.sha }}
