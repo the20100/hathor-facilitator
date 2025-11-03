@@ -9,6 +9,7 @@ import (
 	"github.com/hathor-network/hathor-facilitator/internal/config"
 	"github.com/hathor-network/hathor-facilitator/internal/hathor"
 	"github.com/hathor-network/hathor-facilitator/internal/settle"
+	"github.com/hathor-network/hathor-facilitator/internal/supported"
 	"github.com/hathor-network/hathor-facilitator/internal/verify"
 )
 
@@ -25,10 +26,12 @@ func main() {
 	// Initialize handlers
 	verifyHandler := verify.NewHandler(hathorClient)
 	settleHandler := settle.NewHandler(hathorClient, cfg.MinConfirmations)
+	supportedHandler := supported.NewHandler()
 
 	// Setup routes
 	http.HandleFunc("/verify", verifyHandler.Handle)
 	http.HandleFunc("/settle", settleHandler.Handle)
+	http.HandleFunc("/supported", supportedHandler.Handle)
 	http.HandleFunc("/health", healthHandler)
 
 	// Start server

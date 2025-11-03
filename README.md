@@ -16,8 +16,9 @@ The x402 protocol enables instant, automatic on-chain payments directly over HTT
 
 ## Architecture
 
-The facilitator exposes two main HTTP endpoints:
+The facilitator exposes three main HTTP endpoints:
 
+- `GET /supported` - Returns the supported payment schemes and networks
 - `POST /verify` - Verifies a payment payload without broadcasting
 - `POST /settle` - Broadcasts the transaction and waits for confirmation
 
@@ -80,6 +81,27 @@ go run main.go
 The facilitator will start on port 3000 (or the port specified in `PORT`).
 
 ## API Endpoints
+
+### GET /supported
+
+Returns the supported payment schemes, networks, and assets that this facilitator supports.
+
+**Request:** `GET /supported`
+
+**Response:**
+```json
+{
+  "success": true,
+  "schemes": [
+    {
+      "scheme": "exact",
+      "networks": ["HathorMainnet", "HathorTestnet"],
+      "assets": ["HTR", "00"],
+      "description": "Exact payment scheme - pay a fixed amount for a single request"
+    }
+  ]
+}
+```
 
 ### POST /verify
 
