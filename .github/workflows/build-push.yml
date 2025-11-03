@@ -2,6 +2,7 @@ name: build-and-push
 on:
   push:
     branches: ["main"]
+
 permissions:
   contents: read
   packages: write
@@ -25,6 +26,8 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          build-args: |
+            BUILD_PATH=.
           tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:${{ github.sha }}
+            ghcr.io/the20100/hathor-facilitator:latest
+            ghcr.io/the20100/hathor-facilitator:${{ github.sha }}
