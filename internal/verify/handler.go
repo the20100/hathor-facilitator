@@ -110,10 +110,10 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Network != "HathorMainnet" && req.Network != "HathorTestnet" {
+	if req.Network != "hathor-mainnet" && req.Network != "hathor-testnet" {
 		respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
 			Success: false,
-			Error:   "Unsupported network: must be HathorMainnet or HathorTestnet",
+			Error:   "Unsupported network: must be hathor-mainnet or hathor-testnet",
 		})
 		return
 	}

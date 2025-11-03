@@ -46,7 +46,7 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 		Schemes: []Scheme{
 			{
 				Scheme:      "exact",
-				Networks:    []string{"HathorMainnet", "HathorTestnet"},
+				Networks:    []string{"hathor-mainnet", "hathor-testnet"},
 				Assets:      []string{"HTR", "00"}, // "00" is the token ID for native HTR
 				Description: "Exact payment scheme - pay a fixed amount for a single request",
 			},

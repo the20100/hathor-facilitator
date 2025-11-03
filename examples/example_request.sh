@@ -8,9 +8,9 @@ echo "Example 1: Verifying a payment..."
 #  -H "Content-Type: application/json" \
 #  -d '{
 #    "scheme": "exact",
-#    "network": "HathorTestnet",
+#    "network": "hathor-testnet",
 #    "payload": {
-#      "txHex": "0001000102000007ce56b8597fa4c971b35dafcbc04cf50106a52152df7e9bd5711cae63ae0000204e1dfd10a229fbef8a8d16e3513687982550638fe192275a5bde7fbbd581ed0a0000012c00001976a914ffd45ca4c06a620e80fffff926e0cfa027deca3188ac0000006400001976a9140f0ed2dff2ffe4aab409bed706b56d2ea7428ed588ac0000000000000000000000000000000000"
+#      "txHex": "0001000102000007ce56b8597fa4c971b35dafcbc04cf50106a52152df7e9bd5711cae63ae000020e2b155047b37cc650c030ca6d3dad7cabdc03ed202b8a06eefed6db7d73e3e5a0000006400001976a9140f0ed2dff2ffe4aab409bed706b56d2ea7428ed588ac0000012c00001976a914ffd45ca4c06a620e80fffff926e0cfa027deca3188ac0000000000000000000000000000000000"
 #    },
 #    "requirements": {
 #      "amount": 100,
@@ -18,6 +18,19 @@ echo "Example 1: Verifying a payment..."
 #      "address": "WQ3emmxYypZduTsRgA7x6s1Bj5GqsPcnmo"
 #    }
 #  }' | python3 -m json.tool
+
+{
+    "scheme": "exact",
+    "network": "hathor-testnet",
+    "payload": {
+      "txHex": "0001000102000007ce56b8597fa4c971b35dafcbc04cf50106a52152df7e9bd5711cae63ae000020e2b155047b37cc650c030ca6d3dad7cabdc03ed202b8a06eefed6db7d73e3e5a0000006400001976a9140f0ed2dff2ffe4aab409bed706b56d2ea7428ed588ac0000012c00001976a914ffd45ca4c06a620e80fffff926e0cfa027deca3188ac0000000000000000000000000000000000"
+    },
+    "requirements": {
+      "amount": 100,
+      "asset": "HTR",
+      "address": "WQ3emmxYypZduTsRgA7x6s1Bj5GqsPcnmo"
+    }
+  }
 
 curl -X POST http://localhost:3000/verify \
   -H "Content-Type: application/json" \
@@ -34,7 +47,7 @@ curl -X POST http://localhost:3000/settle \
   -H "Content-Type: application/json" \
   -d '{
     "scheme": "exact",
-    "network": "HathorTestnet",
+    "network": "hathor-testnet",
     "payload": {
       "txHex": "<your-transaction-hex-here>"
     },

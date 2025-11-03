@@ -95,7 +95,7 @@ Returns the supported payment schemes, networks, and assets that this facilitato
   "schemes": [
     {
       "scheme": "exact",
-      "networks": ["HathorMainnet", "HathorTestnet"],
+      "networks": ["hathor-mainnet", "hathor-testnet"],
       "assets": ["HTR", "00"],
       "description": "Exact payment scheme - pay a fixed amount for a single request"
     }
@@ -127,7 +127,7 @@ The facilitator supports two ways to send the payment payload:
    ```json
    {
      "scheme": "exact",
-     "network": "HathorTestnet",
+     "network": "hathor-testnet",
      "payload": {
        "txHex": "00010002..."
      },
@@ -208,7 +208,7 @@ curl -X POST http://localhost:3000/verify \
   -H "Content-Type: application/json" \
   -d '{
     "scheme": "exact",
-    "network": "HathorTestnet",
+    "network": "hathor-testnet",
     "payload": {
       "txHex": "00010002..."
     },
