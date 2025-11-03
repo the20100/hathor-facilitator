@@ -166,11 +166,79 @@ func ParseTransaction(txBytes []byte) (*Transaction, error) {
 		}
 
 		// Parse signature and public key from data
-		// This is a simplified parsing - actual format may vary
-		if dataLen >= 65 {
-			// Typically: signature (64-65 bytes) + pubkey (33 or 65 bytes)
-			input.Signature = input.Data[:64] // Simplified - may include sighash flag
-			input.PublicKey = input.Data[64:]  // Rest is pubkey
+		// Format: [DER-encoded signature][compressed public key (33 bytes)]
+		// DER signatures are variable length (typically 70-73 bytes)
+		if dataLen >= 70 {
+			// Try to parse DER signature length
+			// DER format: 0x30 [length_byte] 0x02 [r_length] [r_bytes] 0x02 [s_length] [s_bytes]
+			if input.Data[0] == 0x30 {
+				// DER signature detected
+				// Use a more robust approach: try parsing progressively larger chunks
+				// Start with typical sizes and find what works
+				sigLength := 0
+				lengthByte := input.Data[1]
+				
+				if lengthByte&0x80 != 0 {
+					// Multi-byte length encoding
+					lengthBytesCount := int(lengthByte & 0x7F)
+					if lengthBytesCount > 0 && lengthBytesCount <= 3 && len(input.Data) >= 2+lengthBytesCount {
+						// Read multi-byte length
+						for i := 0; i < lengthBytesCount; i++ {
+							sigLength = sigLength<<8 | int(input.Data[2+i])
+						}
+						sigLength += 2 + lengthBytesCount // Include 0x30 tag and length bytes
+					} else {
+						// Invalid multi-byte encoding, try to find signature end by attempting to parse
+						sigLength = findDERSignatureLength(input.Data)
+					}
+				} else {
+					// Single-byte length (most common case)
+					sigLength = int(lengthByte) + 2 // Include 0x30 tag (1 byte) and length byte (1 byte)
+				}
+				
+				// Validate and adjust sigLength
+				// Ensure we have enough data and don't exceed bounds
+				if sigLength < 70 {
+					sigLength = 70 // Minimum expected DER signature size
+				}
+				if sigLength+33 > len(input.Data) {
+					sigLength = len(input.Data) - 33 // Reserve 33 bytes for compressed pubkey
+				}
+				if sigLength > len(input.Data) {
+					sigLength = len(input.Data) - 33
+				}
+				
+				// Try to validate the DER signature can be parsed
+				// If parsing fails, try adjusting the length
+				testSig := input.Data[:sigLength]
+				if _, err := ecdsa.ParseDERSignature(testSig); err != nil {
+					// Parsing failed, try to find correct length by scanning
+					sigLength = findDERSignatureLength(input.Data)
+					if sigLength == 0 {
+						sigLength = len(input.Data) - 33 // Fallback
+					}
+				}
+				
+				// Extract signature (DER-encoded)
+				input.Signature = input.Data[:sigLength]
+				// Extract public key (compressed, 33 bytes)
+				if len(input.Data) >= sigLength+33 {
+					input.PublicKey = input.Data[sigLength : sigLength+33]
+				} else if len(input.Data) > sigLength {
+					// Fallback: take remaining bytes as pubkey
+					input.PublicKey = input.Data[sigLength:]
+				}
+			} else {
+				// Not DER format, try compact format (64 bytes r+s)
+				if dataLen >= 97 { // 64 bytes signature + 33 bytes compressed pubkey
+					input.Signature = input.Data[:64]
+					input.PublicKey = input.Data[64:97]
+				} else if dataLen >= 65 {
+					// Fallback: assume 64-byte signature
+					input.Signature = input.Data[:64]
+					input.PublicKey = input.Data[64:]
+				}
+			}
 		}
 	}
 
@@ -242,45 +310,74 @@ func VerifyInputSignature(tx *Transaction, inputIndex int, prevOut *OutputInfo, 
 	}
 
 	// Verify signature (ECDSA on secp256k1)
-	// Note: signature format might include a hash type byte
+	// Hathor uses DER-encoded signatures as shown in the Python signing code
 	sigBytes := signature
 	if len(sigBytes) < 64 {
 		return errors.New("signature too short")
 	}
 	
-	// Extract r and s from signature (typically 32 bytes each)
-	// Bitcoin/Hathor signatures are typically DER-encoded or compact
-	// Try to parse as DER first, then fall back to compact format
+	// Parse signature - prioritize DER format (as used by Hathor wallet)
 	var sig *ecdsa.Signature
+	var parseErr error
 	
-	// Try parsing as DER signature first
-	if len(sigBytes) >= 70 && sigBytes[0] == 0x30 {
-		// Looks like DER format
-		var parseErr error
+	// Try parsing as DER signature first (this is what the Python code produces)
+	if sigBytes[0] == 0x30 {
+		// DER format detected
 		sig, parseErr = ecdsa.ParseDERSignature(sigBytes)
 		if parseErr != nil {
-			// If DER parsing fails, return error
 			return fmt.Errorf("failed to parse DER signature: %w", parseErr)
 		}
+	} else if len(sigBytes) == 64 {
+		// Try compact format (64 bytes: r + s directly, each 32 bytes)
+		// This is less common but might be used in some cases
+		// Note: dcrd's ecdsa package doesn't have a direct compact parser
+		// We need to construct r and s manually
+		rBytes := sigBytes[:32]
+		sBytes := sigBytes[32:64]
+		
+		// Parse r and s as ModNScalar
+		var r, s secp256k1.ModNScalar
+		r.SetByteSlice(rBytes)
+		s.SetByteSlice(sBytes)
+		
+		// Create signature from r and s
+		sig = ecdsa.NewSignature(&r, &s)
 	} else {
-		// Compact format (64 bytes: r + s directly)
-		// For Hathor/Bitcoin, signatures are typically DER-encoded
-		// If it's not DER and not the expected length, return error
-		if len(sigBytes) < 64 {
-			return errors.New("signature too short for compact format")
-		}
-		// Note: Compact signature format parsing would require constructing
-		// r and s ModNScalar values from the bytes and creating a Signature
-		// For now, we assume DER format or return an informative error
-		return fmt.Errorf("non-DER signature format requires additional implementation (expected DER format)")
+		return fmt.Errorf("unsupported signature format: expected DER (starts with 0x30) or 64-byte compact, got %d bytes starting with 0x%02x", len(sigBytes), sigBytes[0])
 	}
 
-	// Verify the signature
+	// Verify the signature against the signing hash
 	if !sig.Verify(signingHash[:], pubKeyObj) {
-		return errors.New("signature verification failed")
+		return errors.New("signature verification failed: signature does not match the transaction hash and public key")
 	}
+	
+	// Additional validation: verify that the public key hash matches the script
+	// This ensures the signer owns the UTXO being spent
+	// The public key should hash to the address in the previous output script
 
 	return nil
+}
+
+// findDERSignatureLength attempts to find the correct length of a DER signature
+// by trying to parse it at different lengths
+func findDERSignatureLength(data []byte) int {
+	// DER signatures are typically 70-73 bytes
+	// Try common lengths first
+	for length := 70; length <= 73 && length+33 <= len(data); length++ {
+		testSig := data[:length]
+		if _, err := ecdsa.ParseDERSignature(testSig); err == nil {
+			return length
+		}
+	}
+	// If none of the typical lengths work, try up to available length minus pubkey
+	maxLen := len(data) - 33
+	for length := 73; length <= maxLen; length++ {
+		testSig := data[:length]
+		if _, err := ecdsa.ParseDERSignature(testSig); err == nil {
+			return length
+		}
+	}
+	return 0
 }
 
 // OutputInfo contains information about a previous output

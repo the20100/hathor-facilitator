@@ -46,7 +46,43 @@ type VerifyResponse struct {
 }
 
 func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
+	log.Printf("=== Verify Request Received ===")
+	log.Printf("Method: %s", r.Method)
+	log.Printf("Path: %s", r.URL.Path)
+	log.Printf("Content-Type: %s", r.Header.Get("Content-Type"))
+	log.Printf("Content-Length: %s", r.Header.Get("Content-Length"))
+	
+	// Log all headers for debugging
+	log.Printf("All request headers:")
+	for name, values := range r.Header {
+		for _, value := range values {
+			// Truncate long headers for readability
+			displayValue := value
+			if len(displayValue) > 200 {
+				displayValue = displayValue[:200] + "... (truncated)"
+			}
+			log.Printf("  %s: %s", name, displayValue)
+		}
+	}
+	
+	// Check X-PAYMENT header with case-insensitive lookup
+	// Go's http.Header.Get is case-insensitive, but we'll try explicit variations just in case
+	paymentHeader := r.Header.Get("X-PAYMENT")
+	if paymentHeader == "" {
+		// Try other case variations if needed
+		paymentHeader = r.Header.Get("x-payment")
+	}
+	if paymentHeader == "" {
+		paymentHeader = r.Header.Get("X-Payment")
+	}
+	
+	log.Printf("X-PAYMENT header present: %v", paymentHeader != "")
+	if paymentHeader != "" {
+		log.Printf("X-PAYMENT header length: %d", len(paymentHeader))
+	}
+	
 	if r.Method != http.MethodPost {
+		log.Printf("Rejected: Method not allowed (got %s, expected POST)", r.Method)
 		respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
 			Success: false,
 			Error:   "Method not allowed",
@@ -58,47 +94,102 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 	var err error
 
 	// Check if payment payload is in X-PAYMENT header (base64-encoded)
-	if paymentHeader := r.Header.Get("X-PAYMENT"); paymentHeader != "" {
+	// (paymentHeader already retrieved above)
+	if paymentHeader != "" {
+		log.Printf("Processing request with X-PAYMENT header (length: %d)", len(paymentHeader))
+		if len(paymentHeader) > 100 {
+			log.Printf("X-PAYMENT header value (first 100 chars): %s...", paymentHeader[:100])
+		} else {
+			log.Printf("X-PAYMENT header value: %s", paymentHeader)
+		}
+		
 		// Decode base64
 		decoded, decodeErr := base64.StdEncoding.DecodeString(paymentHeader)
 		if decodeErr != nil {
 			log.Printf("Failed to decode X-PAYMENT header: %v", decodeErr)
+			log.Printf("X-PAYMENT header value: %s", paymentHeader)
 			respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
 				Success: false,
 				Error:   "Invalid base64 encoding in X-PAYMENT header: " + decodeErr.Error(),
 			})
 			return
 		}
+		
+		log.Printf("Successfully decoded X-PAYMENT header (decoded length: %d bytes)", len(decoded))
+		if len(decoded) > 200 {
+			log.Printf("Decoded content (first 200 chars): %s...", string(decoded[:200]))
+		} else {
+			log.Printf("Decoded content: %s", string(decoded))
+		}
 
 		// Parse JSON from decoded base64
 		if err = json.Unmarshal(decoded, &req); err != nil {
 			log.Printf("Failed to parse X-PAYMENT JSON: %v", err)
+			log.Printf("Decoded content: %s", string(decoded))
 			respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
 				Success: false,
 				Error:   "Invalid JSON in X-PAYMENT header: " + err.Error(),
 			})
 			return
 		}
+		
+		log.Printf("Successfully parsed X-PAYMENT JSON: scheme=%s, network=%s", req.Scheme, req.Network)
 
 		// Read requirements from body if present
-		bodyBytes, _ := ioutil.ReadAll(r.Body)
-		if len(bodyBytes) > 0 {
-			var bodyReq struct {
-				Requirements HathorPaymentRequirements `json:"requirements"`
-			}
-			if json.Unmarshal(bodyBytes, &bodyReq) == nil && bodyReq.Requirements.Address != "" {
-				req.Requirements = bodyReq.Requirements
+		bodyBytes, readErr := ioutil.ReadAll(r.Body)
+		if readErr != nil {
+			log.Printf("Error reading request body: %v", readErr)
+		} else {
+			log.Printf("Request body length: %d bytes", len(bodyBytes))
+			if len(bodyBytes) > 0 {
+				log.Printf("Request body content: %s", string(bodyBytes))
+				var bodyReq struct {
+					Requirements HathorPaymentRequirements `json:"requirements"`
+				}
+				if json.Unmarshal(bodyBytes, &bodyReq) == nil && bodyReq.Requirements.Address != "" {
+					log.Printf("Merging requirements from body: address=%s, amount=%d, asset=%s", 
+						bodyReq.Requirements.Address, bodyReq.Requirements.Amount, bodyReq.Requirements.Asset)
+					req.Requirements = bodyReq.Requirements
+				} else {
+					log.Printf("Body did not contain valid requirements or address is empty")
+				}
+			} else {
+				log.Printf("Request body is empty")
 			}
 		}
 	} else {
+		log.Printf("No X-PAYMENT header found, reading from request body")
+		
+		// Read body first for logging
+		bodyBytes, readErr := ioutil.ReadAll(r.Body)
+		if readErr != nil {
+			log.Printf("Error reading request body: %v", readErr)
+			respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
+				Success: false,
+				Error:   "Error reading request body: " + readErr.Error(),
+			})
+			return
+		}
+		
+		log.Printf("Request body length: %d bytes", len(bodyBytes))
+		if len(bodyBytes) > 0 {
+			log.Printf("Request body content: %s", string(bodyBytes))
+		} else {
+			log.Printf("Request body is empty (EOF)")
+		}
+		
 		// Fall back to reading from request body
-		if err = json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err = json.Unmarshal(bodyBytes, &req); err != nil {
+			log.Printf("Failed to parse JSON from request body: %v", err)
+			log.Printf("Body content was: %s", string(bodyBytes))
 			respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
 				Success: false,
 				Error:   "Bad request JSON: " + err.Error(),
 			})
 			return
 		}
+		
+		log.Printf("Successfully parsed JSON from body: scheme=%s, network=%s", req.Scheme, req.Network)
 	}
 
 	// 1. Check scheme and network
