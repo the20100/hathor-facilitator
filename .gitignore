@@ -19,6 +19,7 @@ go.work
 
 # Binary
 hathor-facilitator
+/scripts
 
 # IDE
 .idea/

@@ -114,8 +114,14 @@ func (c *Client) GetTransaction(txID string) (*TransactionInfo, error) {
 	}
 	defer resp.Body.Close()
 
+	// Handle 404 specifically - transaction not found
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("transaction not found: %s", txID)
+	}
+
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("get transaction failed with status %d", resp.StatusCode)
+		body, _ := ioutil.ReadAll(resp.Body)
+		return nil, fmt.Errorf("get transaction failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
 	body, err := ioutil.ReadAll(resp.Body)
@@ -131,11 +137,16 @@ func (c *Client) GetTransaction(txID string) (*TransactionInfo, error) {
 
 	// Check if response has "success" wrapper (some APIs wrap responses)
 	var txData map[string]interface{}
+	var metaData map[string]interface{}
 	if success, ok := rawData["success"].(bool); ok && success {
 		if tx, ok := rawData["tx"].(map[string]interface{}); ok {
 			txData = tx
 		} else {
 			txData = rawData
+		}
+		// Extract meta if present
+		if meta, ok := rawData["meta"].(map[string]interface{}); ok {
+			metaData = meta
 		}
 	} else {
 		txData = rawData
@@ -175,7 +186,7 @@ func (c *Client) GetTransaction(txID string) (*TransactionInfo, error) {
 						txInfo.Outputs[i].Address = addr
 					}
 				}
-				// Check for spent_by
+				// Check for spent_by in output (direct field)
 				if spentBy, ok := outMap["spent_by"].(map[string]interface{}); ok {
 					txInfo.Outputs[i].SpentBy = &SpentBy{}
 					if txID, ok := spentBy["tx_id"].(string); ok {
@@ -195,12 +206,98 @@ func (c *Client) GetTransaction(txID string) (*TransactionInfo, error) {
 		log.Printf("Warning: Transaction %s has no outputs in response", txID)
 	}
 
+	// Parse spent_outputs from meta (this is the primary way Hathor API indicates spent outputs)
+	if metaData != nil {
+		if spentOutputsRaw, ok := metaData["spent_outputs"]; ok {
+			// spent_outputs can be either:
+			// 1. An object: {"0": "txid", "1": "txid"}
+			// 2. An array: [[0, ["txid"]], [1, []]]
+			
+			// Try object format first
+			if spentOutputsObj, ok := spentOutputsRaw.(map[string]interface{}); ok {
+				for outputIdxStr, txIDRaw := range spentOutputsObj {
+					if txID, ok := txIDRaw.(string); ok && txID != "" {
+						// Parse output index
+						var outputIdx int
+						if n, err := fmt.Sscanf(outputIdxStr, "%d", &outputIdx); err == nil && n == 1 {
+							if outputIdx >= 0 && outputIdx < len(txInfo.Outputs) {
+								if txInfo.Outputs[outputIdx].SpentBy == nil {
+									txInfo.Outputs[outputIdx].SpentBy = &SpentBy{}
+								}
+								txInfo.Outputs[outputIdx].SpentBy.TxID = txID
+								log.Printf("Output %d is spent by transaction %s (from meta.spent_outputs)", outputIdx, txID)
+							}
+						}
+					}
+				}
+			} else if spentOutputsArr, ok := spentOutputsRaw.([]interface{}); ok {
+				// Array format: [[0, ["txid"]], [1, []]]
+				for _, entryRaw := range spentOutputsArr {
+					if entry, ok := entryRaw.([]interface{}); ok && len(entry) >= 2 {
+						if outputIdxFloat, ok := entry[0].(float64); ok {
+							outputIdx := int(outputIdxFloat)
+							if outputIdx >= 0 && outputIdx < len(txInfo.Outputs) {
+								if txIDsArr, ok := entry[1].([]interface{}); ok && len(txIDsArr) > 0 {
+									// Take the first txid from the array
+									if txID, ok := txIDsArr[0].(string); ok && txID != "" {
+										if txInfo.Outputs[outputIdx].SpentBy == nil {
+											txInfo.Outputs[outputIdx].SpentBy = &SpentBy{}
+										}
+										txInfo.Outputs[outputIdx].SpentBy.TxID = txID
+										log.Printf("Output %d is spent by transaction %s (from meta.spent_outputs array)", outputIdx, txID)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	return &txInfo, nil
 }
 
 // GetOutput checks if an output exists and is unspent
+// Fast path: tries the direct get_output node API endpoint first
+// Fallback: uses GetTransaction to parse the transaction and find the output
 func (c *Client) GetOutput(txID string, index int) (*OutputInfo, error) {
-	// First try getting transaction from node API
+	// Fast path: try direct get_output endpoint first
+	url := fmt.Sprintf("%s/get_output?tx_id=%s&index=%d", c.nodeURL, txID, index)
+	resp, err := c.httpClient.Get(url)
+	if err == nil {
+		defer resp.Body.Close()
+		
+		if resp.StatusCode == http.StatusOK {
+			var outputResp struct {
+				Success   bool    `json:"success"`
+				Spent     bool    `json:"spent"`
+				Script    string  `json:"script"`
+				TokenData uint8   `json:"token_data"`
+				Value     uint64  `json:"value"`
+				SpentBy   *SpentBy `json:"spent_by,omitempty"`
+			}
+			
+			body, err := ioutil.ReadAll(resp.Body)
+			if err == nil {
+				if err := json.Unmarshal(body, &outputResp); err == nil && outputResp.Success {
+					// Note: Address is not returned by get_output endpoint, but we don't need it for spent check
+					return &OutputInfo{
+						Value:     outputResp.Value,
+						TokenData: outputResp.TokenData,
+						Script:    outputResp.Script,
+						Address:   "", // Not available from get_output endpoint
+						IsSpent:   outputResp.Spent,
+						SpentBy:   outputResp.SpentBy,
+					}, nil
+				}
+			}
+		}
+		// If fast path fails, fall through to fallback
+		log.Printf("get_output endpoint failed or returned error, falling back to GetTransaction")
+	}
+
+	// Fallback: use GetTransaction to parse the transaction and find the output
 	txInfo, err := c.GetTransaction(txID)
 	if err != nil {
 		// If node API fails, try wallet decode API as fallback
@@ -401,13 +498,18 @@ func (c *Client) DecodeTransaction(txHex string) (*DecodedTransaction, error) {
 	return &respJSON.Tx, nil
 }
 
+// Note: For signature verification, we use dataToSignHash from the DecodeTransaction response
+// if available, otherwise we compute it from the raw transaction bytes.
+// The wallet API may provide this in the decode response for already-signed transactions.
+
 type DecodedTransaction struct {
 	Version            int                  `json:"version"`
 	Type               string               `json:"type"`
 	Tokens             []interface{}        `json:"tokens"`
-	Inputs             []DecodedInput       `json:"inputs"`
+	Inputs             []DecodedInput        `json:"inputs"`
 	Outputs            []DecodedOutput      `json:"outputs"`
 	CompleteSignatures bool                 `json:"completeSignatures"`
+	DataToSignHash     string               `json:"dataToSignHash,omitempty"` // Hash used for signing (if available)
 }
 
 type DecodedInput struct {

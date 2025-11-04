@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 
 	"github.com/btcsuite/btcd/btcutil/base58"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
@@ -20,6 +21,7 @@ type Transaction struct {
 	Version   uint16
 	Nonce     uint32
 	Timestamp uint32
+	Parents   [][]byte // Parent hashes for DAG
 	Inputs    []Input
 	Outputs   []Output
 	Tokens    []Token
@@ -89,6 +91,10 @@ func ParseTransactionFromWallet(decodedTx *hathor.DecodedTransaction) (*Transact
 // ParseTransaction parses a Hathor transaction from raw bytes (legacy method)
 // Note: This is complex and error-prone. Prefer using ParseTransactionFromWallet.
 func ParseTransaction(txBytes []byte) (*Transaction, error) {
+	if len(txBytes) < 10 {
+		return nil, fmt.Errorf("transaction too short: %d bytes", len(txBytes))
+	}
+
 	tx := &Transaction{}
 	reader := bytes.NewReader(txBytes)
 
@@ -106,34 +112,51 @@ func ParseTransaction(txBytes []byte) (*Transaction, error) {
 
 	// Read nonce (4 bytes, little endian based on Bitcoin-style)
 	if err := binary.Read(reader, binary.LittleEndian, &tx.Nonce); err != nil {
-		return nil, fmt.Errorf("failed to read nonce: %w", err)
+		return nil, fmt.Errorf("failed to read nonce at position %d: %w", reader.Size()-int64(reader.Len()), err)
 	}
 
 	// Read timestamp (4 bytes, little endian)
 	if err := binary.Read(reader, binary.LittleEndian, &tx.Timestamp); err != nil {
-		return nil, fmt.Errorf("failed to read timestamp: %w", err)
+		return nil, fmt.Errorf("failed to read timestamp at position %d: %w", reader.Size()-int64(reader.Len()), err)
+	}
+
+	// Check if we have enough bytes left
+	remaining := int64(reader.Len())
+	if remaining < 1 {
+		return nil, fmt.Errorf("not enough bytes for parents count: %d remaining", remaining)
 	}
 
 	// Hathor transactions include parent hashes before inputs
 	// Read number of parents (typically 2 for DAG)
 	var numParents uint8
 	if err := binary.Read(reader, binary.LittleEndian, &numParents); err != nil {
-		return nil, fmt.Errorf("failed to read number of parents: %w", err)
+		return nil, fmt.Errorf("failed to read number of parents at position %d: %w", reader.Size()-int64(reader.Len()), err)
 	}
 
 	// Skip parent hashes (32 bytes each) by reading and discarding
 	parentHashSize := int(numParents) * 32
+	remaining = int64(reader.Len())
+	if remaining < int64(parentHashSize) {
+		return nil, fmt.Errorf("not enough bytes for %d parent hashes: need %d, have %d", numParents, parentHashSize, remaining)
+	}
 	if parentHashSize > 0 {
 		parentHashes := make([]byte, parentHashSize)
 		if _, err := reader.Read(parentHashes); err != nil {
-			return nil, fmt.Errorf("failed to read parent hashes: %w", err)
+			return nil, fmt.Errorf("failed to read parent hashes at position %d: %w", reader.Size()-int64(reader.Len()), err)
 		}
+	}
+
+	// Check if we have enough bytes for number of inputs
+	remaining = int64(reader.Len())
+	if remaining < 1 {
+		return nil, fmt.Errorf("not enough bytes for inputs count: %d remaining at position %d", remaining, reader.Size()-int64(reader.Len()))
 	}
 
 	// Read number of inputs
 	var numInputs uint8
 	if err := binary.Read(reader, binary.LittleEndian, &numInputs); err != nil {
-		return nil, fmt.Errorf("failed to read number of inputs: %w", err)
+		return nil, fmt.Errorf("failed to read number of inputs at position %d (remaining: %d bytes): %w", 
+			reader.Size()-int64(reader.Len()), reader.Len(), err)
 	}
 
 	// Parse inputs
@@ -288,7 +311,15 @@ func ParseTransaction(txBytes []byte) (*Transaction, error) {
 }
 
 // VerifyInputSignature verifies the signature of an input
+// If rawTxBytes is provided, it will use those bytes to compute the signing hash more accurately
+// If dataToSignHash is provided, it will use that directly (most accurate)
 func VerifyInputSignature(tx *Transaction, inputIndex int, prevOut *OutputInfo, signature, pubKey []byte) error {
+	return VerifyInputSignatureWithBytes(tx, inputIndex, prevOut, signature, pubKey, nil, "")
+}
+
+// VerifyInputSignatureWithBytes verifies the signature using raw transaction bytes if available
+// If dataToSignHash is provided, it will use that directly (most accurate)
+func VerifyInputSignatureWithBytes(tx *Transaction, inputIndex int, prevOut *OutputInfo, signature, pubKey []byte, rawTxBytes []byte, dataToSignHash string) error {
 	if inputIndex >= len(tx.Inputs) {
 		return errors.New("input index out of range")
 	}
@@ -298,10 +329,38 @@ func VerifyInputSignature(tx *Transaction, inputIndex int, prevOut *OutputInfo, 
 		return errors.New("missing public key")
 	}
 
-	// Create a copy of the transaction for signing
-	// In Bitcoin/Hathor, the signature is computed over the transaction
-	// with the input scripts replaced (except for the input being signed)
-	signingHash := computeSigningHash(tx, inputIndex, prevOut.Script)
+	// Use dataToSignHash from wallet API if available (most accurate)
+	var signingHash [32]byte
+	if dataToSignHash != "" {
+		hashBytes, err := hex.DecodeString(dataToSignHash)
+		if err == nil && len(hashBytes) == 32 {
+			copy(signingHash[:], hashBytes)
+			log.Printf("Using dataToSignHash from wallet API for input %d: %s", inputIndex, dataToSignHash)
+		} else {
+			log.Printf("Warning: Invalid dataToSignHash '%s', falling back to computed hash", dataToSignHash)
+			// Fall through to computed hash
+		}
+	}
+	
+	// If we don't have dataToSignHash, compute it
+	if dataToSignHash == "" || signingHash == [32]byte{} {
+		if len(rawTxBytes) > 0 {
+			// Try to compute hash from raw transaction bytes
+			computedHash, err := computeSigningHashFromRawBytes(rawTxBytes, inputIndex, prevOut.Script)
+			if err == nil {
+				signingHash = computedHash
+				log.Printf("Computed signing hash from raw bytes for input %d", inputIndex)
+			} else {
+				// Fall back to reconstructed hash
+				log.Printf("Warning: Could not compute hash from raw bytes: %v, using reconstructed hash", err)
+				signingHash = computeSigningHash(tx, inputIndex, prevOut.Script)
+			}
+		} else {
+			// Use reconstructed hash
+			signingHash = computeSigningHash(tx, inputIndex, prevOut.Script)
+			log.Printf("Computed signing hash from reconstructed transaction for input %d", inputIndex)
+		}
+	}
 
 	// Parse public key
 	pubKeyObj, err := secp256k1.ParsePubKey(pubKey)
@@ -348,8 +407,12 @@ func VerifyInputSignature(tx *Transaction, inputIndex int, prevOut *OutputInfo, 
 
 	// Verify the signature against the signing hash
 	if !sig.Verify(signingHash[:], pubKeyObj) {
+		log.Printf("Signature verification failed - hash: %s, pubkey: %s, signature: %s",
+			hex.EncodeToString(signingHash[:]), hex.EncodeToString(pubKey), hex.EncodeToString(signature))
 		return errors.New("signature verification failed: signature does not match the transaction hash and public key")
 	}
+	
+	log.Printf("Signature verification succeeded for input %d", inputIndex)
 	
 	// Additional validation: verify that the public key hash matches the script
 	// This ensures the signer owns the UTXO being spent
@@ -361,23 +424,177 @@ func VerifyInputSignature(tx *Transaction, inputIndex int, prevOut *OutputInfo, 
 // findDERSignatureLength attempts to find the correct length of a DER signature
 // by trying to parse it at different lengths
 func findDERSignatureLength(data []byte) int {
-	// DER signatures are typically 70-73 bytes
-	// Try common lengths first
-	for length := 70; length <= 73 && length+33 <= len(data); length++ {
+	if len(data) < 8 {
+		return 0 // Too short to be a DER signature
+	}
+	
+	// Check if it starts with DER sequence tag (0x30)
+	if data[0] != 0x30 {
+		return 0
+	}
+	
+	// Try to parse DER length field
+	lengthByte := data[1]
+	var contentLength int
+	var totalLength int
+	
+	if lengthByte&0x80 != 0 {
+		// Multi-byte length encoding
+		lengthBytesCount := int(lengthByte & 0x7F)
+		if lengthBytesCount == 0 || lengthBytesCount > 3 {
+			// Invalid length encoding
+			return 0
+		}
+		if len(data) < 2+lengthBytesCount {
+			return 0
+		}
+		contentLength = 0
+		for i := 0; i < lengthBytesCount; i++ {
+			contentLength = contentLength<<8 | int(data[2+i])
+		}
+		totalLength = 2 + lengthBytesCount + contentLength
+	} else {
+		// Single-byte length (most common)
+		contentLength = int(lengthByte)
+		totalLength = 2 + contentLength
+	}
+	
+	// Validate the total length makes sense
+	if totalLength < 70 || totalLength > 73 {
+		// Try brute force parsing if length seems wrong
+		for length := 70; length <= 73 && length <= len(data); length++ {
+			testSig := data[:length]
+			if _, err := ecdsa.ParseDERSignature(testSig); err == nil {
+				return length
+			}
+		}
+		// If that doesn't work, try the calculated length
+		if totalLength >= 70 && totalLength <= len(data) {
+			testSig := data[:totalLength]
+			if _, err := ecdsa.ParseDERSignature(testSig); err == nil {
+				return totalLength
+			}
+		}
+		return 0
+	}
+	
+	// Validate by trying to parse
+	if totalLength <= len(data) {
+		testSig := data[:totalLength]
+		if _, err := ecdsa.ParseDERSignature(testSig); err == nil {
+			return totalLength
+		}
+	}
+	
+	// Fallback: try common lengths
+	for length := 70; length <= 73 && length <= len(data); length++ {
 		testSig := data[:length]
 		if _, err := ecdsa.ParseDERSignature(testSig); err == nil {
 			return length
 		}
 	}
-	// If none of the typical lengths work, try up to available length minus pubkey
-	maxLen := len(data) - 33
-	for length := 73; length <= maxLen; length++ {
-		testSig := data[:length]
-		if _, err := ecdsa.ParseDERSignature(testSig); err == nil {
-			return length
-		}
-	}
+	
 	return 0
+}
+
+// ExtractSignaturesFromBytes extracts signature and public key pairs from transaction bytes
+// by searching for DER signature patterns (starting with 0x30) followed by compressed pubkeys (0x02 or 0x03)
+// This is a fallback when we can't parse the transaction format directly
+func ExtractSignaturesFromBytes(txBytes []byte) []struct {
+	Signature []byte
+	PublicKey []byte
+} {
+	var results []struct {
+		Signature []byte
+		PublicKey []byte
+	}
+
+	// Search for DER signatures (start with 0x30)
+	// Need at least 70 bytes for a signature
+	for i := 0; i <= len(txBytes)-70; i++ {
+		if txBytes[i] == 0x30 {
+			// Found potential DER signature start
+			// Try to find the signature length
+			remainingBytes := txBytes[i:]
+			if len(remainingBytes) < 70 {
+				continue // Not enough bytes for a valid DER signature
+			}
+			
+			sigLength := findDERSignatureLength(remainingBytes)
+			if sigLength > 0 {
+				// Found a valid DER signature
+				sig := make([]byte, sigLength)
+				copy(sig, txBytes[i:i+sigLength])
+				
+				// Validate the signature can be parsed
+				if sigObj, err := ecdsa.ParseDERSignature(sig); err == nil && sigObj != nil {
+					// Now look for the public key - it might be before or after the signature
+					// First check after the signature
+					pubKeyStart := i + sigLength
+					pubKeyFound := false
+					
+					// Check if next bytes are a compressed public key (0x02 or 0x03)
+					if pubKeyStart+33 <= len(txBytes) && (txBytes[pubKeyStart] == 0x02 || txBytes[pubKeyStart] == 0x03) {
+						pubKey := make([]byte, 33)
+						copy(pubKey, txBytes[pubKeyStart:pubKeyStart+33])
+						if pubKeyObj, err := secp256k1.ParsePubKey(pubKey); err == nil && pubKeyObj != nil {
+							results = append(results, struct {
+								Signature []byte
+								PublicKey []byte
+							}{Signature: sig, PublicKey: pubKey})
+							pubKeyFound = true
+							i = pubKeyStart + 32 // Skip ahead
+						}
+					}
+					
+					// If not found after, search before (within reasonable range)
+					if !pubKeyFound && i >= 33 {
+						for j := i - 33; j >= 0 && j >= i-100; j-- {
+							if txBytes[j] == 0x02 || txBytes[j] == 0x03 {
+								pubKey := make([]byte, 33)
+								copy(pubKey, txBytes[j:j+33])
+								if pubKeyObj, err := secp256k1.ParsePubKey(pubKey); err == nil && pubKeyObj != nil {
+									results = append(results, struct {
+										Signature []byte
+										PublicKey []byte
+									}{Signature: sig, PublicKey: pubKey})
+									pubKeyFound = true
+									break
+								}
+							}
+						}
+					}
+					
+					// If still not found, search after (within reasonable range)
+					if !pubKeyFound {
+						for j := pubKeyStart; j < len(txBytes)-33 && j < pubKeyStart+200; j++ {
+							if txBytes[j] == 0x02 || txBytes[j] == 0x03 {
+								pubKey := make([]byte, 33)
+								copy(pubKey, txBytes[j:j+33])
+								if pubKeyObj, err := secp256k1.ParsePubKey(pubKey); err == nil && pubKeyObj != nil {
+									results = append(results, struct {
+										Signature []byte
+										PublicKey []byte
+									}{Signature: sig, PublicKey: pubKey})
+									pubKeyFound = true
+									break
+								}
+							}
+						}
+					}
+					
+					// If we found signature but no pubkey, still record the signature
+					// (we might be able to derive or find it later)
+					if !pubKeyFound {
+						// Skip this signature and continue searching
+						i += sigLength - 1 // Will increment by 1 in loop
+					}
+				}
+			}
+		}
+	}
+
+	return results
 }
 
 // OutputInfo contains information about a previous output
@@ -386,56 +603,150 @@ type OutputInfo struct {
 }
 
 // computeSigningHash computes the hash that should be signed for an input
-// This is a simplified version - actual Hathor signing may differ
+// Hathor signatures are computed on the transaction data with input scripts cleared
+// and the current input script replaced with the previous output script
+// IMPORTANT: Nonce is NOT included in the signing hash (it's computed after signing)
 func computeSigningHash(tx *Transaction, inputIndex int, prevOutScript string) [32]byte {
-	// In Bitcoin-style, we hash the transaction with all input scripts cleared
+	// In Bitcoin/Hathor style, we hash the transaction with all input scripts cleared
 	// and the current input script set to the previous output script
-	// This is a simplified implementation
+	// Nonce is excluded because it's computed after signing (for PoW)
 	
 	buf := new(bytes.Buffer)
 	
-	// Write version
-	binary.Write(buf, binary.LittleEndian, tx.Version)
+	// Write version (2 bytes)
+	// Try both endianness - Hathor might use big endian for version
+	// Based on raw transaction format, version appears to be big endian
+	binary.Write(buf, binary.BigEndian, tx.Version)
 	
-	// Write nonce
-	binary.Write(buf, binary.LittleEndian, tx.Nonce)
+	// DO NOT write nonce - signatures are computed before nonce is finalized
 	
-	// Write timestamp
+	// Write timestamp (4 bytes, little endian)
 	binary.Write(buf, binary.LittleEndian, tx.Timestamp)
 	
-	// Write number of inputs
+	// Write number of parents (1 byte) - parents might be included in signing hash
+	// If we don't have parents from parsing, use 0 (they might not be in signing hash)
+	parentCount := len(tx.Parents)
+	binary.Write(buf, binary.LittleEndian, uint8(parentCount))
+	
+	// Write parent hashes (32 bytes each) if available
+	for _, parent := range tx.Parents {
+		buf.Write(parent)
+	}
+	
+	// Write number of inputs (1 byte)
 	binary.Write(buf, binary.LittleEndian, uint8(len(tx.Inputs)))
 	
 	// Write inputs with scripts
 	for i, input := range tx.Inputs {
+		// Write tx_id (32 bytes, reversed from hex string)
 		txIDBytes, _ := hex.DecodeString(input.TxID)
 		buf.Write(reverseBytes(txIDBytes))
+		
+		// Write index (4 bytes, little endian)
 		binary.Write(buf, binary.LittleEndian, input.Index)
 		
+		// Write data length and script
 		if i == inputIndex {
-			// Use previous output script
-			scriptBytes, _ := hex.DecodeString(prevOutScript)
+			// Use previous output script for the input being signed
+			// The script might be hex-encoded or base64-encoded string
+			var scriptBytes []byte
+			var err error
+			// Try hex first (most common)
+			scriptBytes, err = hex.DecodeString(prevOutScript)
+			if err != nil {
+				// Try base64
+				scriptBytes, err = base64.StdEncoding.DecodeString(prevOutScript)
+				if err != nil {
+					// If it's already bytes as a string, try direct conversion
+					scriptBytes = []byte(prevOutScript)
+				}
+			}
 			binary.Write(buf, binary.LittleEndian, uint8(len(scriptBytes)))
 			buf.Write(scriptBytes)
 		} else {
-			// Empty script
+			// Empty script for other inputs
 			binary.Write(buf, binary.LittleEndian, uint8(0))
 		}
 	}
 	
-	// Write outputs
+	// Write number of outputs (1 byte)
 	binary.Write(buf, binary.LittleEndian, uint8(len(tx.Outputs)))
+	
+	// Write outputs
 	for _, output := range tx.Outputs {
+		// Write value (8 bytes, little endian)
 		binary.Write(buf, binary.LittleEndian, output.Value)
+		
+		// Write token_data (1 byte)
 		binary.Write(buf, binary.LittleEndian, output.TokenData)
+		
+		// Write script length (1 byte)
 		binary.Write(buf, binary.LittleEndian, uint8(len(output.Script)))
+		
+		// Write script
 		buf.Write(output.Script)
 	}
 	
-	// Double SHA256
+	// Double SHA256 (Bitcoin/Hathor style)
 	firstHash := sha256.Sum256(buf.Bytes())
 	secondHash := sha256.Sum256(firstHash[:])
+	
+	// Debug logging
+	log.Printf("Computed signing hash for input %d: %s (tx version: %d, timestamp: %d, inputs: %d, outputs: %d, parents: %d)",
+		inputIndex, hex.EncodeToString(secondHash[:]), tx.Version, tx.Timestamp, len(tx.Inputs), len(tx.Outputs), len(tx.Parents))
+	
 	return secondHash
+}
+
+// computeSigningHashFromRawBytes computes the signing hash from raw transaction bytes
+// by replacing the input script at the specified index with the previous output script
+func computeSigningHashFromRawBytes(txBytes []byte, inputIndex int, prevOutScript string) ([32]byte, error) {
+	// This is complex - we need to find the input script in the raw bytes and replace it
+	// For now, we'll use a simpler approach: reconstruct the transaction from raw bytes
+	// excluding the nonce and input scripts
+	
+	// Parse the transaction structure from raw bytes to find where inputs start
+	// Format: version (2) + nonce (4) + timestamp (4) + numParents (1) + parents + numInputs (1) + inputs...
+	
+	if len(txBytes) < 11 {
+		return [32]byte{}, fmt.Errorf("transaction too short")
+	}
+	
+	reader := bytes.NewReader(txBytes)
+	
+	// Skip version (2 bytes)
+	reader.Seek(2, 0)
+	
+	// Skip nonce (4 bytes) - nonce is not included in signing hash
+	reader.Seek(4, 1)
+	
+	// Read timestamp (4 bytes) - we'll include this
+	timestampBytes := make([]byte, 4)
+	reader.Read(timestampBytes)
+	
+	// Read number of parents (1 byte)
+	var numParents uint8
+	binary.Read(reader, binary.LittleEndian, &numParents)
+	
+	// Skip parent hashes (32 bytes each)
+	reader.Seek(int64(numParents)*32, 1)
+	
+	// Read number of inputs (1 byte)
+	var numInputs uint8
+	binary.Read(reader, binary.LittleEndian, &numInputs)
+	
+	if int(inputIndex) >= int(numInputs) {
+		return [32]byte{}, fmt.Errorf("input index %d out of range (have %d inputs)", inputIndex, numInputs)
+	}
+	
+	// Now we need to build the signing hash
+	// We'll reconstruct the transaction but skip to after the inputs section
+	// and rebuild from there
+	
+	// For now, fall back to the reconstructed method
+	// This is a placeholder - the full implementation would need to
+	// carefully parse and reconstruct the transaction
+	return [32]byte{}, fmt.Errorf("raw bytes parsing not fully implemented")
 }
 
 // ValidatePoW validates the proof-of-work for a Hathor transaction

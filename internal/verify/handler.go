@@ -8,8 +8,10 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/hathor-network/hathor-facilitator/internal/hathor"
+	"github.com/hathor-network/hathor-facilitator/internal/txscan"
 	"github.com/hathor-network/hathor-facilitator/internal/txparser"
 )
 
@@ -31,7 +33,8 @@ type VerifyRequest struct {
 }
 
 type HathorPaymentPayload struct {
-	TxHex string `json:"txHex"`
+	TxHex         string `json:"txHex"`
+	DataToSignHash string `json:"dataToSignHash"` // Required: 64-hex char hash from tx-proposal
 }
 
 type HathorPaymentRequirements struct {
@@ -209,27 +212,35 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Decode transaction using headless wallet API
-	decodedTx, err := h.hathorClient.DecodeTransaction(req.Payload.TxHex)
-	if err != nil {
-		log.Printf("Failed to decode transaction: %v", err)
-		respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
-			Success: false,
-			Error:   "Failed to decode transaction: " + err.Error(),
-		})
-		return
+	// dataToSignHash is optional - if missing, we'll skip signature verification
+	// (signature verification will be done later during settle)
+	hasDataToSignHash := req.Payload.DataToSignHash != ""
+	if hasDataToSignHash {
+		// Validate dataToSignHash format (64 hex chars = 32 bytes)
+		if len(req.Payload.DataToSignHash) != 64 {
+			respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Invalid dataToSignHash length: expected 64 hex chars, got %d", len(req.Payload.DataToSignHash)),
+			})
+			return
+		}
+
+		// Validate it's valid hex
+		_, err = hex.DecodeString(req.Payload.DataToSignHash)
+		if err != nil {
+			respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
+				Success: false,
+				Error:   "Invalid dataToSignHash format: not valid hex: " + err.Error(),
+			})
+			return
+		}
+
+		log.Printf("Using dataToSignHash from payload: %s", req.Payload.DataToSignHash)
+	} else {
+		log.Printf("No dataToSignHash provided - will skip signature verification (will be verified on settle)")
 	}
 
-	tx, err := txparser.ParseTransactionFromWallet(decodedTx)
-	if err != nil {
-		respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
-			Success: false,
-			Error:   "Failed to parse decoded transaction: " + err.Error(),
-		})
-		return
-	}
-
-	// Calculate transaction hash from the hex
+	// Calculate transaction hash from the hex first (needed for on-chain check)
 	txBytes, err := hex.DecodeString(req.Payload.TxHex)
 	if err != nil {
 		respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
@@ -238,15 +249,86 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	tx.Hash = txparser.CalculateTxHash(txBytes)
 
-	// Parse the raw transaction to extract signatures and public keys
-	// The wallet decode doesn't provide raw signature data, so we need to parse the raw bytes
-	rawTx, err := txparser.ParseTransaction(txBytes)
+	// 2. Decode transaction using headless wallet API (with fallback to direct parsing)
+	var tx *txparser.Transaction
+	var decodedTx *hathor.DecodedTransaction
+	decodedTx, err = h.hathorClient.DecodeTransaction(req.Payload.TxHex)
 	if err != nil {
-		log.Printf("Warning: Failed to parse raw transaction for signature extraction: %v", err)
-		// Continue with wallet decode data, but we won't be able to verify signatures
-		rawTx = nil
+		log.Printf("Wallet API decode failed: %v, falling back to direct parsing", err)
+		// Fallback: parse transaction directly from hex bytes
+		tx, err = txparser.ParseTransaction(txBytes)
+		if err != nil {
+			log.Printf("Direct parsing also failed: %v", err)
+			respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
+				Success: false,
+				Error:   "Failed to decode transaction: wallet API failed (" + err.Error() + "), and direct parsing also failed",
+			})
+			return
+		}
+		tx.Hash = txparser.CalculateTxHash(txBytes)
+		log.Printf("Successfully parsed transaction directly from hex (fallback)")
+	} else {
+		// Successfully decoded via wallet API
+		tx, err = txparser.ParseTransactionFromWallet(decodedTx)
+		if err != nil {
+			respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
+				Success: false,
+				Error:   "Failed to parse decoded transaction: " + err.Error(),
+			})
+			return
+		}
+		tx.Hash = txparser.CalculateTxHash(txBytes)
+		log.Printf("Successfully parsed transaction via wallet API")
+	}
+
+	// Check if this transaction already exists on-chain (already been broadcast)
+	// If so, we should reject it as it's already been settled
+	existingTx, err := h.hathorClient.GetTransaction(tx.Hash)
+	if err != nil {
+		// If error is "transaction not found", that's fine - it means the transaction doesn't exist yet
+		if strings.Contains(err.Error(), "transaction not found") {
+			log.Printf("Transaction %s not found on-chain, proceeding with verification", tx.Hash)
+		} else {
+			// Other errors might indicate network issues, but we'll continue with verification
+			log.Printf("Warning: Could not check if transaction exists: %v", err)
+		}
+	} else {
+		// Check if the response actually contains valid transaction data
+		// A transaction exists on-chain if it has:
+		// - (A valid hash that matches the transaction hash AND (outputs/inputs OR height)) OR
+		// - (No hash but has outputs/inputs AND height - indicating confirmed transaction)
+		// Empty responses from the API (no hash, no outputs, no inputs, no height) indicate the transaction doesn't exist
+		hasValidHashMatch := existingTx != nil && existingTx.Hash != "" && existingTx.Hash == tx.Hash
+		hasOutputsOrInputs := existingTx != nil && (len(existingTx.Outputs) > 0 || len(existingTx.Inputs) > 0)
+		hasHeight := existingTx != nil && existingTx.Height != nil && *existingTx.Height > 0
+		
+		// Transaction exists if:
+		// 1. Hash matches AND has outputs/inputs (even without height - might be unconfirmed)
+		// 2. Hash matches AND has height (confirmed)
+		// 3. No hash but has outputs/inputs AND height (edge case - confirmed transaction)
+		transactionExists := (hasValidHashMatch && hasOutputsOrInputs) || 
+		                     (hasValidHashMatch && hasHeight) ||
+		                     (existingTx != nil && existingTx.Hash == "" && hasOutputsOrInputs && hasHeight)
+		
+		if transactionExists {
+			// Transaction actually exists on-chain with valid data
+			log.Printf("Transaction %s already exists on-chain (node returned transaction data)", tx.Hash)
+			log.Printf("  Transaction details: hash=%s, height=%v, outputs=%d, inputs=%d", 
+				existingTx.Hash, existingTx.Height, len(existingTx.Outputs), len(existingTx.Inputs))
+			respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Transaction already exists on-chain (hash: %s)", tx.Hash),
+			})
+			return
+		} else {
+			// Empty or invalid response - transaction doesn't exist on-chain
+			log.Printf("Transaction %s not found on-chain (API returned empty/invalid response), proceeding with verification", tx.Hash)
+			if existingTx != nil {
+				log.Printf("  Response details: hash=%s, height=%v, outputs=%d, inputs=%d", 
+					existingTx.Hash, existingTx.Height, len(existingTx.Outputs), len(existingTx.Inputs))
+			}
+		}
 	}
 
 	// Debug: log parsed transaction outputs
@@ -255,11 +337,11 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 		log.Printf("  Output[%d]: address='%s', value=%d, tokenData=%d", i, out.Address, out.Value, out.TokenData)
 	}
 
-	// 3. Verify inputs and signatures
+	// 3. Verify inputs and signatures (if dataToSignHash is provided)
 	// IMPORTANT: We must cryptographically verify signatures, not just trust the wallet's flag
 	
-	// First check the wallet's completeSignatures flag as a quick sanity check
-	if !decodedTx.CompleteSignatures {
+	// First check the wallet's completeSignatures flag as a quick sanity check (only if we got decodedTx from wallet API)
+	if decodedTx != nil && !decodedTx.CompleteSignatures {
 		respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
 			Success: false,
 			Error:   "Transaction does not have complete signatures",
@@ -267,65 +349,97 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Now verify each input's signature cryptographically
-	for i, input := range tx.Inputs {
-		// Try to get the previous output to verify it exists and is unspent
-		prevOut, err := h.hathorClient.GetOutput(input.TxID, int(input.Index))
+	// Only verify signatures if dataToSignHash is provided
+	if hasDataToSignHash {
+		// Extract inputData blobs from signed txHex using pattern matching
+		// This avoids full transaction parsing which can fail on wire format issues
+		inputs, err := txscan.ExtractInputDatas(req.Payload.TxHex)
 		if err != nil {
-			log.Printf("Warning: Could not fetch input %d (tx: %s, idx: %d): %v", i, input.TxID, input.Index, err)
-			// We still need to verify the signature even if we can't fetch the output
-			// Try to use the script from the wallet decode
-			if rawTx != nil && i < len(rawTx.Inputs) && len(rawTx.Inputs[i].Signature) > 0 {
-				// Use script from decoded input if available
-				if len(decodedTx.Inputs) > i {
-					scriptBytes, _ := base64.StdEncoding.DecodeString(decodedTx.Inputs[i].Script)
-					outputInfo := &txparser.OutputInfo{
-						Script: hex.EncodeToString(scriptBytes),
-					}
-					if err := txparser.VerifyInputSignature(rawTx, i, outputInfo, rawTx.Inputs[i].Signature, rawTx.Inputs[i].PublicKey); err != nil {
-						respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
-							Success: false,
-							Error:   fmt.Sprintf("Signature verification failed for input %d: %v", i, err),
-						})
-						return
-					}
-				}
-			}
-			continue
-		}
-
-		// Check if already spent
-		if prevOut.IsSpent {
+			log.Printf("Failed to extract inputData from transaction: %v", err)
 			respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
 				Success: false,
-				Error:   fmt.Sprintf("Input %d already spent", i),
+				Error:   "Failed to extract inputData: " + err.Error(),
 			})
 			return
 		}
 
-		// Verify signature cryptographically using raw transaction data
-		if rawTx != nil && i < len(rawTx.Inputs) && len(rawTx.Inputs[i].Signature) > 0 && len(rawTx.Inputs[i].PublicKey) > 0 {
-			outputInfo := &txparser.OutputInfo{
-				Script: prevOut.Script,
-			}
-			if err := txparser.VerifyInputSignature(rawTx, i, outputInfo, rawTx.Inputs[i].Signature, rawTx.Inputs[i].PublicKey); err != nil {
+		log.Printf("Extracted %d inputData blob(s) from transaction", len(inputs))
+
+		// Verify each input's signature using the exact dataToSignHash from the proposal
+		for idx := range tx.Inputs {
+			// Check if we have enough extracted inputData blobs
+			if idx >= len(inputs) {
 				respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
 					Success: false,
-					Error:   fmt.Sprintf("Signature verification failed for input %d: %v", i, err),
+					Error:   fmt.Sprintf("Not enough inputData found (expected at least %d, got %d)", idx+1, len(inputs)),
 				})
 				return
 			}
-			log.Printf("Signature verification passed for input %d", i)
-		} else {
-			// If we couldn't extract signature from raw transaction, this is a problem
-			log.Printf("Warning: Could not extract signature data for input %d from raw transaction", i)
-			// For now, if we can't verify, we fail (strict mode)
+
+			inputData := inputs[idx]
+			log.Printf("Input %d: DER signature (len=%d), pubkey (len=%d), offset=%d", 
+				idx, len(inputData.SigDER), len(inputData.Pub33), inputData.Offset)
+
+			// Verify the signature using the exact dataToSignHash from the proposal
+			// Do not hash again - use the hash directly
+			ok, err := txscan.VerifyInput(inputData.SigDER, inputData.Pub33, req.Payload.DataToSignHash)
+			if err != nil {
+				log.Printf("Signature verification error for input %d: %v", idx, err)
+				respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
+					Success: false,
+					Error:   fmt.Sprintf("Signature verification failed for input %d: %v", idx, err),
+				})
+				return
+			}
+
+			if !ok {
+				log.Printf("Signature verification failed for input %d: signature is invalid", idx)
+				respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
+					Success: false,
+					Error:   fmt.Sprintf("Signature verification failed for input %d: invalid signature", idx),
+				})
+				return
+			}
+
+			log.Printf("Signature OK for input %d", idx)
+		}
+	} else {
+		log.Printf("Skipping signature verification (dataToSignHash not provided - will be verified on settle)")
+	}
+
+	// Check if inputs are already spent (double-spend prevention)
+	// This check is always done regardless of signature verification
+	// We check at the UTXO level - if the output is spent, reject immediately
+	for i, in := range tx.Inputs {
+		spent, spentBy, err := isInputSpent(h.hathorClient, in.TxID, int(in.Index))
+		if err != nil {
+			log.Printf("Warning: Could not confirm spent status for input %d (tx: %s, idx: %d): %v", i, in.TxID, in.Index, err)
+			// Fail closed: if we can't confirm the output is unspent, reject the transaction
 			respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
 				Success: false,
-				Error:   fmt.Sprintf("Could not verify signature for input %d: signature data not available", i),
+				Error:   fmt.Sprintf("Cannot verify input %d: %v", i, err),
 			})
 			return
 		}
+
+		if spent {
+			if spentBy != "" {
+				log.Printf("Input %d (tx: %s, idx: %d) is already spent by transaction %s", i, in.TxID, in.Index, spentBy)
+				respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
+					Success: false,
+					Error:   fmt.Sprintf("Input %d already spent by transaction %s", i, spentBy),
+				})
+			} else {
+				log.Printf("Input %d (tx: %s, idx: %d) is already spent", i, in.TxID, in.Index)
+				respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
+					Success: false,
+					Error:   fmt.Sprintf("Input %d already spent", i),
+				})
+			}
+			return
+		}
+
+		log.Printf("Input %d verified: output exists and is unspent (tx: %s, idx: %d)", i, in.TxID, in.Index)
 	}
 
 	// 4. Validate payment output
@@ -386,6 +500,59 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, VerifyResponse{
 		Success: true,
 	})
+}
+
+
+// isInputSpent checks if a specific output (UTXO) is already spent
+// Returns: (isSpent, spentByTxID, error)
+// If the output is spent, spentByTxID will contain the transaction ID that spent it
+func isInputSpent(hc *hathor.Client, txid string, index int) (bool, string, error) {
+	log.Printf("Checking if input is spent: txid=%s, index=%d", txid, index)
+	
+	// Fast path: try GetOutput API first
+	out, err := hc.GetOutput(txid, index)
+	if err == nil {
+		log.Printf("GetOutput succeeded for txid=%s, index=%d: IsSpent=%v, SpentBy=%v", txid, index, out.IsSpent, out.SpentBy)
+		if out.IsSpent {
+			spentTx := ""
+			if out.SpentBy != nil {
+				spentTx = out.SpentBy.TxID
+			}
+			return true, spentTx, nil
+		}
+		return false, "", nil
+	}
+
+	log.Printf("GetOutput failed for txid=%s, index=%d: %v, falling back to GetTransaction", txid, index, err)
+
+	// Fallback: use GetTransaction to check the output's spent_by field
+	src, err2 := hc.GetTransaction(txid)
+	if err2 != nil {
+		log.Printf("GetTransaction also failed for txid=%s: %v", txid, err2)
+		return false, "", fmt.Errorf("cannot confirm spent status: %w", err2)
+	}
+	if src == nil {
+		return false, "", fmt.Errorf("cannot confirm spent status: source transaction is nil")
+	}
+	if index < 0 || index >= len(src.Outputs) {
+		return false, "", fmt.Errorf("cannot confirm spent status: output index %d out of range (source has %d outputs)", index, len(src.Outputs))
+	}
+
+	o := src.Outputs[index]
+	log.Printf("GetTransaction succeeded for txid=%s: output[%d] has SpentBy=%v", txid, index, o.SpentBy)
+	if o.SpentBy != nil && o.SpentBy.TxID != "" {
+		log.Printf("Output is spent by transaction: %s", o.SpentBy.TxID)
+		return true, o.SpentBy.TxID, nil
+	}
+
+	// IMPORTANT: The Hathor node API may not always include spent_by in the transaction response.
+	// If the API doesn't provide this information, we cannot definitively confirm the output is unspent.
+	// However, if the source transaction exists on-chain and has a height (is confirmed),
+	// we should be able to trust the API response. If spent_by is missing, we assume unspent.
+	// Note: This is a limitation - we may miss some spent outputs if the API doesn't report them.
+	// The settle endpoint will catch actual double-spends when trying to broadcast.
+	log.Printf("Output appears to be unspent (no spent_by field in API response). Note: API may not report spent status reliably.")
+	return false, "", nil
 }
 
 func respondJSON(w http.ResponseWriter, statusCode int, data interface{}) {

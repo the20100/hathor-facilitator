@@ -20,7 +20,7 @@ func Load() (*Config, error) {
 		HathorNodeURL:     getEnv("HATHOR_NODE_URL", "http://localhost:8080"),
 		HathorWalletURL:   getEnv("HATHOR_WALLET_URL", "http://localhost:8000"),
 		HathorWalletID:    getEnv("HATHOR_WALLET_ID", "main-wallet"),
-		MinConfirmations:  getEnvAsInt("MIN_CONFIRMATIONS", 1),
+		MinConfirmations:  getEnvAsInt("MIN_CONFIRMATIONS", 0),
 	}
 
 	// Validate required fields
