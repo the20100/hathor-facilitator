@@ -514,7 +514,8 @@ func (c *Client) DecodeTransaction(txHex string) (*DecodedTransaction, error) {
 	for _, inRaw := range respJSON.Tx.Inputs {
 		if inMap, ok := inRaw.(map[string]interface{}); ok {
 			var input DecodedInput
-			if txID, ok := inMap["tx"].(string); ok {
+			// Full node API uses "tx_id" not "tx"
+			if txID, ok := inMap["tx_id"].(string); ok {
 				input.TxID = txID
 			}
 			if idx, ok := inMap["index"].(float64); ok {
@@ -526,6 +527,9 @@ func (c *Client) DecodeTransaction(txHex string) (*DecodedTransaction, error) {
 			if token, ok := inMap["token"].(string); ok {
 				input.Token = token
 			}
+			if tokenData, ok := inMap["token_data"].(float64); ok {
+				input.TokenData = uint8(tokenData)
+			}
 			if script, ok := inMap["script"].(string); ok {
 				input.Script = script
 			}
@@ -536,9 +540,12 @@ func (c *Client) DecodeTransaction(txHex string) (*DecodedTransaction, error) {
 				if t, ok := decoded["type"].(string); ok {
 					input.Decoded.Type = t
 				}
+				// timelock can be null, so check for both float64 and nil
 				if timelock, ok := decoded["timelock"].(float64); ok {
 					tl := int64(timelock)
 					input.Decoded.Timelock = &tl
+				} else if decoded["timelock"] == nil {
+					input.Decoded.Timelock = nil
 				}
 			}
 			decodedTx.Inputs = append(decodedTx.Inputs, input)
@@ -565,9 +572,15 @@ func (c *Client) DecodeTransaction(txHex string) (*DecodedTransaction, error) {
 				if addr, ok := decoded["address"].(string); ok {
 					output.Decoded.Address = addr
 				}
+				if t, ok := decoded["type"].(string); ok {
+					output.Type = t
+				}
+				// timelock can be null, so check for both float64 and nil
 				if timelock, ok := decoded["timelock"].(float64); ok {
 					tl := int64(timelock)
 					output.Decoded.Timelock = &tl
+				} else if decoded["timelock"] == nil {
+					output.Decoded.Timelock = nil
 				}
 			}
 			decodedTx.Outputs = append(decodedTx.Outputs, output)
@@ -579,7 +592,7 @@ func (c *Client) DecodeTransaction(txHex string) (*DecodedTransaction, error) {
 
 // Note: For signature verification, we use dataToSignHash from the DecodeTransaction response
 // if available, otherwise we compute it from the raw transaction bytes.
-// The wallet API may provide this in the decode response for already-signed transactions.
+// The full node API may provide this in the decode response for already-signed transactions.
 
 type DecodedTransaction struct {
 	Version            int                  `json:"version"`

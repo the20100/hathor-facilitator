@@ -54,6 +54,7 @@ The facilitator can be configured using environment variables:
 - `PORT` - HTTP server port (default: 3000)
 - `HATHOR_NODE_URL` - Hathor full node URL (default: `http://localhost:8080`)
 - `HATHOR_WALLET_URL` - Hathor headless wallet URL (default: `http://localhost:8000`)
+- `HATHOR_MINING_SERVICE_URL`- Hathor mining service to push tx (default: https://txmining.india.testnet.hathor.network)
 - `HATHOR_WALLET_ID` - Wallet ID for headless wallet (default: `main-wallet`)
 - `MIN_CONFIRMATIONS` - Minimum confirmations required before returning success (default: 1)
 

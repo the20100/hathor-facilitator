@@ -35,6 +35,7 @@ dev:
 	@PORT=3000 \
 	HATHOR_NODE_URL=http://localhost:8080 \
 	HATHOR_WALLET_URL=http://localhost:8000 \
+	HATHOR_MINING_SERVICE_URL=https://txmining.india.testnet.hathor.network \
 	HATHOR_WALLET_ID=facilitator-wallet \
 	MIN_CONFIRMATIONS=1 \
 	go run main.go

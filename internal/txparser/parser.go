@@ -34,7 +34,7 @@ type Input struct {
 	Data      []byte
 	Signature []byte
 	PublicKey []byte
-	Address   string // Store decoded address from wallet for payer identification
+	Address   string
 }
 
 type Output struct {

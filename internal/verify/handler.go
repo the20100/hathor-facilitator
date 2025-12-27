@@ -250,28 +250,31 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Decode transaction using headless wallet API (with fallback to direct parsing)
+	// 2. Decode transaction using full node API (with fallback to direct parsing)
 	var tx *txparser.Transaction
 	var decodedTx *hathor.DecodedTransaction
+	log.Printf("Decoding transaction via full node API...")
 	decodedTx, err = h.hathorClient.DecodeTransaction(req.Payload.TxHex)
 	if err != nil {
-		log.Printf("Wallet API decode failed: %v, falling back to direct parsing", err)
+		log.Printf("Full node API decode failed: %v, falling back to direct parsing", err)
 		// Fallback: parse transaction directly from hex bytes
 		tx, err = txparser.ParseTransaction(txBytes)
 		if err != nil {
 			log.Printf("Direct parsing also failed: %v", err)
 			respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
 				Success: false,
-				Error:   "Failed to decode transaction: wallet API failed (" + err.Error() + "), and direct parsing also failed",
+				Error:   "Failed to decode transaction: full node API failed (" + err.Error() + "), and direct parsing also failed",
 			})
 			return
 		}
 		tx.Hash = txparser.CalculateTxHash(txBytes)
 		log.Printf("Successfully parsed transaction directly from hex (fallback)")
 	} else {
-		// Successfully decoded via wallet API
+		// Successfully decoded via full node API
+		log.Printf("Full node API decode succeeded, parsing decoded transaction...")
 		tx, err = txparser.ParseTransactionFromWallet(decodedTx)
 		if err != nil {
+			log.Printf("Failed to parse decoded transaction from node API: %v", err)
 			respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
 				Success: false,
 				Error:   "Failed to parse decoded transaction: " + err.Error(),
@@ -279,7 +282,7 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		tx.Hash = txparser.CalculateTxHash(txBytes)
-		log.Printf("Successfully parsed transaction via wallet API")
+		log.Printf("Successfully parsed transaction via full node API")
 	}
 
 	// Check if this transaction already exists on-chain (already been broadcast)
@@ -338,15 +341,12 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. Verify inputs and signatures (if dataToSignHash is provided)
-	// IMPORTANT: We must cryptographically verify signatures, not just trust the wallet's flag
+	// IMPORTANT: We must cryptographically verify signatures, not just trust the node's flag
 	
-	// First check the wallet's completeSignatures flag as a quick sanity check (only if we got decodedTx from wallet API)
-	if decodedTx != nil && !decodedTx.CompleteSignatures {
-		respondJSON(w, http.StatusPaymentRequired, VerifyResponse{
-			Success: false,
-			Error:   "Transaction does not have complete signatures",
-		})
-		return
+	// Note: The full node API doesn't provide CompleteSignatures field, so it's always set to true
+	// by default in the client. We rely on cryptographic signature verification below instead.
+	if decodedTx != nil {
+		log.Printf("Decoded transaction from node API: %d inputs, %d outputs", len(decodedTx.Inputs), len(decodedTx.Outputs))
 	}
 
 	// Only verify signatures if dataToSignHash is provided
