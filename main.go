@@ -21,7 +21,7 @@ func main() {
 	}
 
 	// Initialize Hathor client
-	hathorClient := hathor.NewClient(cfg.HathorNodeURL, cfg.HathorWalletURL, cfg.HathorWalletID)
+	hathorClient := hathor.NewClient(cfg.HathorNodeURL, cfg.HathorMiningServiceURL)
 
 	// Initialize handlers
 	verifyHandler := verify.NewHandler(hathorClient)
@@ -38,7 +38,7 @@ func main() {
 	addr := fmt.Sprintf(":%d", cfg.Port)
 	log.Printf("Hathor x402 Facilitator starting on %s", addr)
 	log.Printf("Hathor Node: %s", cfg.HathorNodeURL)
-	log.Printf("Hathor Wallet: %s", cfg.HathorWalletURL)
+	log.Printf("Hathor Mining Service: %s", cfg.HathorMiningServiceURL)
 	
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatalf("Server failed: %v", err)

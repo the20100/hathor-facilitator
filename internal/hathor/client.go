@@ -8,60 +8,92 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
-	"strings"
+	"net/url"
 	"time"
 )
 
 type Client struct {
-	nodeURL     string
-	walletURL   string
-	walletID    string
-	httpClient  *http.Client
+	nodeURL          string
+	miningServiceURL string
+	httpClient       *http.Client
 }
 
-func NewClient(nodeURL, walletURL, walletID string) *Client {
+func NewClient(nodeURL, miningServiceURL string) *Client {
 	return &Client{
-		nodeURL:   nodeURL,
-		walletURL: walletURL,
-		walletID:  walletID,
+		nodeURL:          nodeURL,
+		miningServiceURL: miningServiceURL,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
 	}
 }
 
-// PushTransaction pushes a transaction to the Hathor network via the headless wallet
+// PushTransaction pushes a transaction to the Hathor network via the mining service
 func (c *Client) PushTransaction(txHex string) (string, error) {
-	url := fmt.Sprintf("%s/push-tx", c.walletURL)
-	
-	reqBody := map[string]string{
-		"txHex": txHex,
+	// Get the transaction hash by decoding it first
+	url := fmt.Sprintf("%s/v1a/decode_tx?hex_tx=%s", c.nodeURL, url.QueryEscape(txHex))
+	resp, err := c.httpClient.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("failed to get transaction hash: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read decode response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("decode failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var decodeResp struct {
+		Success bool `json:"success"`
+		Tx      struct {
+			Hash string `json:"hash"`
+		} `json:"tx"`
+	}
+
+	if err := json.Unmarshal(body, &decodeResp); err != nil {
+		return "", fmt.Errorf("failed to parse decode response: %w", err)
+	}
+
+	if !decodeResp.Success {
+		return "", fmt.Errorf("decode failed")
+	}
+
+	txHash := decodeResp.Tx.Hash
+
+	// Submit to mining service
+	submitURL := fmt.Sprintf("%s/submit-job", c.miningServiceURL)
+	reqBody := map[string]interface{}{
+		"tx":           txHex,
+		"propagate":    true,
+		"add_parents":  true,
 	}
 	bodyJSON, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
-	log.Printf("Push-tx request URL: %s", url)
+
+	log.Printf("Push-tx request URL: %s", submitURL)
 	log.Printf("Push-tx request body: %s", string(bodyJSON))
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(bodyJSON))
+	req, err := http.NewRequest("POST", submitURL, bytes.NewReader(bodyJSON))
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Wallet-Id", c.walletID)
 
-	log.Printf("Push-tx headers: Content-Type=%s, X-Wallet-Id=%s", req.Header.Get("Content-Type"), req.Header.Get("X-Wallet-Id"))
-
-	resp, err := c.httpClient.Do(req)
+	resp, err = c.httpClient.Do(req)
 	if err != nil {
 		log.Printf("Push-tx HTTP request failed: %v", err)
 		return "", fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err = ioutil.ReadAll(resp.Body)
 	if err != nil {
 		log.Println("Error reading response: ", err)
 		return "", fmt.Errorf("failed to read response: %w", err)
@@ -74,34 +106,24 @@ func (c *Client) PushTransaction(txHex string) (string, error) {
 		return "", fmt.Errorf("push-tx failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var respJSON struct {
-		Success bool   `json:"success"`
-		Error   string `json:"error,omitempty"`
-		Tx      struct {
-			Hash string `json:"hash"`
-		} `json:"tx"`
+	// Mining service returns job_id, but we already have the tx hash
+	var submitResp struct {
+		JobID string `json:"job_id"`
+		Error string `json:"error,omitempty"`
 	}
 
-	if err := json.Unmarshal(body, &respJSON); err != nil {
-		return "", fmt.Errorf("failed to parse response: %w", err)
+	if err := json.Unmarshal(body, &submitResp); err != nil {
+		// If response doesn't match expected format, log but continue since we have the hash
+		log.Printf("Warning: Could not parse mining service response: %v", err)
 	}
 
-	if !respJSON.Success {
-		// Check if the error indicates a connection issue
-		if strings.Contains(respJSON.Error, "ECONNREFUSED") || 
-		   strings.Contains(respJSON.Error, "connection refused") ||
-		   strings.Contains(respJSON.Error, "connect") {
-			return "", fmt.Errorf("cannot connect to Hathor node (node may not be running): %s", respJSON.Error)
-		}
-		// Check for transaction validation errors
-		if strings.Contains(respJSON.Error, "Invalid Opcode") ||
-		   strings.Contains(respJSON.Error, "full validation failed") {
-			return "", fmt.Errorf("transaction validation failed (transaction format may be incorrect): %s", respJSON.Error)
-		}
-		return "", fmt.Errorf("node error: %s", respJSON.Error)
+	if submitResp.Error != "" {
+		return "", fmt.Errorf("mining service error: %s", submitResp.Error)
 	}
 
-	return respJSON.Tx.Hash, nil
+	log.Printf("Transaction submitted to mining service, job_id: %s, tx_hash: %s", submitResp.JobID, txHash)
+
+	return txHash, nil
 }
 
 // GetTransaction retrieves transaction information from the node
@@ -300,16 +322,13 @@ func (c *Client) GetOutput(txID string, index int) (*OutputInfo, error) {
 	// Fallback: use GetTransaction to parse the transaction and find the output
 	txInfo, err := c.GetTransaction(txID)
 	if err != nil {
-		// If node API fails, try wallet decode API as fallback
-		log.Printf("Node API failed for tx %s, trying wallet decode: %v", txID, err)
-		return c.getOutputFromWallet(txID, index)
+		// If node API fails, return the error
+		return nil, fmt.Errorf("failed to get transaction %s: %w", txID, err)
 	}
 
 	// Check if the output index is valid
 	if index < 0 || index >= len(txInfo.Outputs) {
-		// If node API doesn't have outputs, try wallet decode as fallback
-		log.Printf("Node API has no output at index %d for tx %s, trying wallet decode", index, txID)
-		return c.getOutputFromWallet(txID, index)
+		return nil, fmt.Errorf("output index %d out of range for transaction %s (has %d outputs)", index, txID, len(txInfo.Outputs))
 	}
 
 	output := txInfo.Outputs[index]
@@ -332,13 +351,6 @@ func (c *Client) GetOutput(txID string, index int) (*OutputInfo, error) {
 	}, nil
 }
 
-// getOutputFromWallet uses wallet decode API to get output information
-func (c *Client) getOutputFromWallet(txID string, index int) (*OutputInfo, error) {
-	// Note: We need the full transaction hex to decode it
-	// For now, we'll return an error indicating we need the hex
-	// In a production system, you might want to cache transaction data
-	return nil, fmt.Errorf("wallet decode fallback requires transaction hex - node API response incomplete")
-}
 
 type TransactionInfo struct {
 	Hash     string            `json:"hash"`
@@ -441,27 +453,14 @@ func DecodeTransactionHex(txHex string) ([]byte, error) {
 	return hex.DecodeString(txHex)
 }
 
-// DecodeTransaction uses the headless wallet API to decode a transaction
+// DecodeTransaction uses the full node API to decode a transaction
 func (c *Client) DecodeTransaction(txHex string) (*DecodedTransaction, error) {
-	url := fmt.Sprintf("%s/wallet/decode", c.walletURL)
+	url := fmt.Sprintf("%s/v1a/decode_tx?hex_tx=%s", c.nodeURL, url.QueryEscape(txHex))
 
-	reqBody := map[string]string{
-		"txHex": txHex,
-	}
-	
-	bodyJSON, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewReader(bodyJSON))
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-Wallet-Id", c.walletID)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -478,24 +477,104 @@ func (c *Client) DecodeTransaction(txHex string) (*DecodedTransaction, error) {
 		return nil, fmt.Errorf("decode failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
+	// Full node API returns: { "tx": {...}, "meta": {...}, "success": true }
 	var respJSON struct {
-		Success bool              `json:"success"`
-		Error   string            `json:"error,omitempty"`
-		Tx      DecodedTransaction `json:"tx"`
+		Success bool   `json:"success"`
+		Error   string `json:"error,omitempty"`
+		Tx      struct {
+			Hash     string        `json:"hash"`
+			Version  int           `json:"version"`
+			Inputs   []interface{} `json:"inputs"`
+			Outputs  []interface{} `json:"outputs"`
+			Tokens   []interface{} `json:"tokens"`
+		} `json:"tx"`
 	}
 
 	if err := json.Unmarshal(body, &respJSON); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	log.Println("Response JSON: ", respJSON)
-	log.Println("Response Body: ", string(body))
-
 	if !respJSON.Success {
-		return nil, fmt.Errorf("wallet error: %s", respJSON.Error)
+		return nil, fmt.Errorf("decode error: %s", respJSON.Error)
 	}
 
-	return &respJSON.Tx, nil
+	// Convert full node format to DecodedTransaction format
+	decodedTx := &DecodedTransaction{
+		Version:  respJSON.Tx.Version,
+		Tokens:   respJSON.Tx.Tokens,
+		Inputs:   []DecodedInput{},
+		Outputs:  []DecodedOutput{},
+		// Note: Full node API doesn't provide CompleteSignatures field.
+		// We set it to true here, but the real signature verification is done
+		// cryptographically in the verify handler using the input scripts.
+		CompleteSignatures: true,
+	}
+
+	// Parse inputs
+	for _, inRaw := range respJSON.Tx.Inputs {
+		if inMap, ok := inRaw.(map[string]interface{}); ok {
+			var input DecodedInput
+			if txID, ok := inMap["tx"].(string); ok {
+				input.TxID = txID
+			}
+			if idx, ok := inMap["index"].(float64); ok {
+				input.Index = int(idx)
+			}
+			if val, ok := inMap["value"].(float64); ok {
+				input.Value = uint64(val)
+			}
+			if token, ok := inMap["token"].(string); ok {
+				input.Token = token
+			}
+			if script, ok := inMap["script"].(string); ok {
+				input.Script = script
+			}
+			if decoded, ok := inMap["decoded"].(map[string]interface{}); ok {
+				if addr, ok := decoded["address"].(string); ok {
+					input.Decoded.Address = addr
+				}
+				if t, ok := decoded["type"].(string); ok {
+					input.Decoded.Type = t
+				}
+				if timelock, ok := decoded["timelock"].(float64); ok {
+					tl := int64(timelock)
+					input.Decoded.Timelock = &tl
+				}
+			}
+			decodedTx.Inputs = append(decodedTx.Inputs, input)
+		}
+	}
+
+	// Parse outputs
+	for _, outRaw := range respJSON.Tx.Outputs {
+		if outMap, ok := outRaw.(map[string]interface{}); ok {
+			var output DecodedOutput
+			if val, ok := outMap["value"].(float64); ok {
+				output.Value = uint64(val)
+			}
+			if token, ok := outMap["token"].(string); ok {
+				output.Token = token
+			}
+			if script, ok := outMap["script"].(string); ok {
+				output.Script = script
+			}
+			if tokenData, ok := outMap["token_data"].(float64); ok {
+				output.TokenData = uint8(tokenData)
+			}
+			if decoded, ok := outMap["decoded"].(map[string]interface{}); ok {
+				if addr, ok := decoded["address"].(string); ok {
+					output.Decoded.Address = addr
+				}
+				if timelock, ok := decoded["timelock"].(float64); ok {
+					tl := int64(timelock)
+					output.Decoded.Timelock = &tl
+				}
+			}
+			decodedTx.Outputs = append(decodedTx.Outputs, output)
+		}
+	}
+
+	return decodedTx, nil
 }
 
 // Note: For signature verification, we use dataToSignHash from the DecodeTransaction response

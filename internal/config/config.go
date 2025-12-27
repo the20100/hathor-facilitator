@@ -7,28 +7,26 @@ import (
 )
 
 type Config struct {
-	Port              int
-	HathorNodeURL     string
-	HathorWalletURL   string
-	HathorWalletID    string
-	MinConfirmations  int
+	Port                 int
+	HathorNodeURL        string
+	HathorMiningServiceURL string
+	MinConfirmations     int
 }
 
 func Load() (*Config, error) {
 	cfg := &Config{
-		Port:              getEnvAsInt("PORT", 3000),
-		HathorNodeURL:     getEnv("HATHOR_NODE_URL", "http://localhost:8080"),
-		HathorWalletURL:   getEnv("HATHOR_WALLET_URL", "http://localhost:8000"),
-		HathorWalletID:    getEnv("HATHOR_WALLET_ID", "main-wallet"),
-		MinConfirmations:  getEnvAsInt("MIN_CONFIRMATIONS", 0),
+		Port:                  getEnvAsInt("PORT", 3000),
+		HathorNodeURL:         getEnv("HATHOR_NODE_URL", "http://localhost:8080"),
+		HathorMiningServiceURL: getEnv("HATHOR_MINING_SERVICE_URL", "https://txmining.testnet.hathor.network"),
+		MinConfirmations:      getEnvAsInt("MIN_CONFIRMATIONS", 0),
 	}
 
 	// Validate required fields
 	if cfg.HathorNodeURL == "" {
 		return nil, fmt.Errorf("HATHOR_NODE_URL is required")
 	}
-	if cfg.HathorWalletURL == "" {
-		return nil, fmt.Errorf("HATHOR_WALLET_URL is required")
+	if cfg.HathorMiningServiceURL == "" {
+		return nil, fmt.Errorf("HATHOR_MINING_SERVICE_URL is required")
 	}
 
 	return cfg, nil
